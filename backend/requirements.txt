@@ -9,3 +9,5 @@ numpy
 scikit-learn
 xgboost
 requests
+streamlit
+urllib3<2
