@@ -74,7 +74,8 @@ frontend/.env.*.local
 
 # --- Runtime Caches & Dynamic State ---
 # (Uncomment below if you want dynamic price/risk caches excluded from version control)
-# backend/risk_state_cache.json
+# backend/data/storage/risk_state_cache.json
+# backend/data/storage/offline_weather_cache.csv
 
 # --- OS & Editor Metadata ---
 .DS_Store

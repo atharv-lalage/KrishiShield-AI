@@ -93,8 +93,12 @@ if 'commodity' in df_oct.columns:
         'max_price': 'max'
     }).reset_index()
 
-    grouped.to_csv('maha_mandi_prices_oct2025.csv', index=False)
-    print("Success! Saved: maha_mandi_prices_oct2025.csv")
+    from pathlib import Path
+    output_dir = Path(__file__).resolve().parent.parent / "data" / "processed"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    out_file = output_dir / 'maha_mandi_prices_oct2025.csv'
+    grouped.to_csv(out_file, index=False)
+    print(f"Success! Saved: {out_file}")
     print(grouped.head())
 
 else:

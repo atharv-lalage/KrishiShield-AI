@@ -1,17 +1,31 @@
+import sys
+from pathlib import Path
+from datetime import timedelta, date
+import pickle
 import streamlit as st
 import pandas as pd
-import numpy as np
-import pickle
-from datetime import timedelta, date
-import os
 import xgboost as xgb
-import requests
-from io import StringIO
+
+# Ensure backend directory is on sys.path
+backend_dir = Path(__file__).resolve().parent
+if str(backend_dir) not in sys.path:
+    sys.path.insert(0, str(backend_dir))
+
+from src.core.config import (
+    PRIMARY_DATA_FILE,
+    FALLBACK_DATA_FILE,
+    WEATHER_CACHE_FILE,
+    MODEL_DIR,
+    DATA_PROCESSED_DIR,
+)
+from src.services.weather_service import (
+    fetch_extended_weather,
+    load_weather_from_cache,
+    update_weather_cache,
+)
 
 # --- Configuration ---
-PRIMARY_DATA_FILE = "semifinal.csv"
-FALLBACK_DATA_FILE = "test.csv"
-CACHE_FILE = "offline_weather_cache.csv"
+CACHE_FILE = str(WEATHER_CACHE_FILE)
 LAG_WINDOW = 4
 PRICE_COLUMN = "Modal_Price"
 
@@ -22,9 +36,9 @@ PRICE_COLUMN = "Modal_Price"
 def load_base_data():
     """Loads raw data to get Market list."""
     file_to_load = (
-        PRIMARY_DATA_FILE if os.path.exists(PRIMARY_DATA_FILE) else FALLBACK_DATA_FILE
+        PRIMARY_DATA_FILE if PRIMARY_DATA_FILE.exists() else FALLBACK_DATA_FILE
     )
-    if not os.path.exists(file_to_load):
+    if not file_to_load.exists():
         st.error(f"Base data file ({file_to_load}) not found.")
         return pd.DataFrame()
 
@@ -38,7 +52,7 @@ def load_base_data():
             ):
                 df = df.drop(columns=[df.columns[0]])
         return df
-    except:
+    except Exception:
         return pd.DataFrame()
 
 
@@ -46,7 +60,7 @@ def load_base_data():
 def get_market_coordinates():
     """Extracts market coordinates."""
     file_to_load = (
-        PRIMARY_DATA_FILE if os.path.exists(PRIMARY_DATA_FILE) else FALLBACK_DATA_FILE
+        PRIMARY_DATA_FILE if PRIMARY_DATA_FILE.exists() else FALLBACK_DATA_FILE
     )
     try:
         df = pd.read_csv(file_to_load, index_col=False)
@@ -62,14 +76,14 @@ def get_market_coordinates():
             )
             return coords.to_dict("index")
         return {}
-    except:
+    except Exception:
         return {}
 
 
 @st.cache_data
 def get_seasonal_averages(commodity, market_name, target_month):
-    """Calculates historical averages from commodity-specific files."""
-    file_name = f"{commodity.lower()}_market_lagged_features.csv"
+    """Calculates historical averages from commodity-specific lagged feature files."""
+    file_path = DATA_PROCESSED_DIR / f"{commodity.lower()}_market_lagged_features.csv"
     defaults = {
         "Modal_Price": 2500.0,
         "temperature_2m_max": 30.0,
@@ -81,11 +95,11 @@ def get_seasonal_averages(commodity, market_name, target_month):
         "weather_code": 0.0,
     }
 
-    if not os.path.exists(file_name):
+    if not file_path.exists():
         return defaults
 
     try:
-        df = pd.read_csv(file_name, index_col=[0, 1], parse_dates=True)
+        df = pd.read_csv(file_path, index_col=[0, 1], parse_dates=True)
         df.index.names = ["Market Name", "Price Date"]
         try:
             df_market = df.xs(market_name, level="Market Name", drop_level=False)
@@ -112,138 +126,49 @@ def get_seasonal_averages(commodity, market_name, target_month):
 
 @st.cache_resource
 def load_artifacts(commodity_name):
-    """Loads model/scaler dynamically based on crop name."""
-    model_filename = f"{commodity_name}.pkl"
-    scaler_filename = f"{commodity_name.lower()}_scaler.pkl"
+    """Loads model/scaler dynamically based on crop name from models/ directory."""
+    model_path = MODEL_DIR / f"{commodity_name}.pkl"
+    scaler_path = MODEL_DIR / f"{commodity_name.lower()}_scaler.pkl"
+
+    # Also handle Onion json diff model if needed
+    if "onion" in commodity_name.lower():
+        json_path = MODEL_DIR / "onion_xgboost_model_diff.json"
+        if json_path.exists():
+            try:
+                model = xgb.XGBRegressor()
+                model.load_model(str(json_path))
+                return model, None
+            except Exception:
+                pass
 
     try:
-        with open(model_filename, "rb") as f:
+        with open(model_path, "rb") as f:
             model = pickle.load(f)
         if isinstance(model, xgb.XGBRegressor):
             model.set_params(device="cpu", tree_method="hist")
             try:
                 model.get_booster().set_param({"device": "cpu", "tree_method": "hist"})
-            except:
+            except Exception:
                 pass
-        with open(scaler_filename, "rb") as f:
+        with open(scaler_path, "rb") as f:
             scaler = pickle.load(f)
         return model, scaler
     except FileNotFoundError:
         return None, None
 
 
-# --- 2. ROBUST Caching System ---
-
-
-def update_weather_cache(new_data, lat, lon):
-    """Safely updates the cache."""
-    try:
-        df_new = new_data.copy()
-        df_new["lat"] = round(lat, 4)
-        df_new["lon"] = round(lon, 4)
-
-        if os.path.exists(CACHE_FILE):
-            try:
-                df_old = pd.read_csv(CACHE_FILE, index_col="Date", parse_dates=True)
-                df_combined = pd.concat([df_old, df_new])
-                df_combined = (
-                    df_combined.reset_index()
-                    .drop_duplicates(subset=["Date", "lat", "lon"], keep="last")
-                    .set_index("Date")
-                )
-                df_combined.to_csv(CACHE_FILE)
-            except Exception:
-                df_new.to_csv(CACHE_FILE)
-        else:
-            df_new.to_csv(CACHE_FILE)
-    except Exception as e:
-        print(f"Cache Write Error: {e}")
-
-
-def load_weather_from_cache(lat, lon, start_date, end_date):
-    """Retrieves data from cache."""
-    if not os.path.exists(CACHE_FILE):
-        return pd.DataFrame(), "Cache Empty"
-
-    try:
-        df = pd.read_csv(CACHE_FILE, index_col="Date", parse_dates=True)
-        lat_mask = (df["lat"] >= lat - 0.1) & (df["lat"] <= lat + 0.1)
-        lon_mask = (df["lon"] >= lon - 0.1) & (df["lon"] <= lon + 0.1)
-        df_loc = df[lat_mask & lon_mask].copy()
-
-        if df_loc.empty:
-            return pd.DataFrame(), "No Data for Location"
-
-        mask_date = (df_loc.index >= pd.Timestamp(start_date)) & (
-            df_loc.index <= pd.Timestamp(end_date)
-        )
-        df_range = df_loc[mask_date]
-
-        if (
-            not df_range.empty
-            and (df_range.index.max() - df_range.index.min()).days >= 20
-        ):
-            return (
-                df_range.sort_index().drop(columns=["lat", "lon"]),
-                "Offline Cache (Exact)",
-            )
-
-        df_loc = df_loc.sort_index()
-        last_date = df_loc.index.max()
-        fallback_start = last_date - timedelta(days=25)
-        df_fallback = df_loc[df_loc.index >= fallback_start]
-
-        return (
-            df_fallback.drop(columns=["lat", "lon"]),
-            f"Offline Cache (Last Updated: {last_date.date()})",
-        )
-
-    except Exception as e:
-        return pd.DataFrame(), f"Cache Read Error: {e}"
-
-
-# --- 3. Fetch Logic ---
+# --- 2. Fetch Logic (Using Services) ---
 
 
 def fetch_unified_weather(lat, lon):
     """Fetches weather data. Tries Online first, falls back to Cache."""
-    today = date.today()
-    start_date = today - timedelta(days=7)
-    end_date = today + timedelta(days=16)
-
-    url = "https://api.open-meteo.com/v1/forecast"
-    params = {
-        "latitude": lat,
-        "longitude": lon,
-        "daily": "weather_code,temperature_2m_max,temperature_2m_min,temperature_2m_mean,precipitation_sum,precipitation_hours,wind_speed_10m_max",
-        "timezone": "auto",
-        "past_days": 7,
-        "forecast_days": 16,
-    }
-
-    try:
-        r = requests.get(url, params=params, timeout=3)
-        r.raise_for_status()
-        data = r.json()
-        daily_data = data.get("daily", {})
-        df = pd.DataFrame(daily_data)
-        if not df.empty:
-            df["Date"] = pd.to_datetime(df["time"])
-            df = df.set_index("Date").drop(columns=["time"])
-            update_weather_cache(df, lat, lon)
-            return df, "Open-Meteo API (Live)"
-    except Exception:
-        pass
-
-    st.warning("⚠️ Internet unreachable. Switching to Offline Mode.")
-    df_cache, status_msg = load_weather_from_cache(lat, lon, start_date, end_date)
-
-    if not df_cache.empty:
-        return df_cache, status_msg
-    return pd.DataFrame(), status_msg
+    df, status_msg = fetch_extended_weather(lat, lon)
+    if "Cache" in status_msg or "Unavailable" in status_msg:
+        st.warning(f"⚠️ Status: {status_msg}")
+    return df, status_msg
 
 
-# --- 4. Scenario Builder ---
+# --- 3. Scenario Builder ---
 
 
 def build_hybrid_scenario(df_api, historical_avgs):
@@ -346,7 +271,7 @@ def prepare_input_features(simulated_data, model_features, baseline_price):
     return X_pred
 
 
-# --- 5. Advisory Logic ---
+# --- 4. Advisory Logic ---
 
 
 def get_advisory(risk_label, crop_name):
@@ -366,7 +291,7 @@ def get_advisory(risk_label, crop_name):
     elif "MODERATE" in risk_label:
         return {
             "title": f"⚠️ Cautionary Advisory for {crop_name}",
-            "body": f"Conditions are deviating from the historical norm. Moderate stress on the crop is expected, with prices projected to be slightly elevated.",
+            "body": "Conditions are deviating from the historical norm. Moderate stress on the crop is expected, with prices projected to be slightly elevated.",
             "steps": [
                 "**Monitor Closely:** Increase frequency of field inspections for early signs of stress or pests.",
                 "**Irrigation:** Manage water carefully; avoid over-irrigation if rain forecasts are erratic.",
@@ -377,7 +302,7 @@ def get_advisory(risk_label, crop_name):
     else:
         return {
             "title": f"✅ Favorable Advisory for {crop_name}",
-            "body": f"Weather forecasts align well with historical norms. Conditions are favorable for a standard or high yield.",
+            "body": "Weather forecasts align well with historical norms. Conditions are favorable for a standard or high yield.",
             "steps": [
                 "**Maximize Yield:** Focus on standard agronomic practices (weeding, timely fertilization) to capitalize on good weather.",
                 "**Market Strategy:** Good weather often leads to higher supply and stable prices. Plan your storage or post-harvest logistics early.",
@@ -387,7 +312,7 @@ def get_advisory(risk_label, crop_name):
         }
 
 
-# --- Main App ---
+# --- 5. Main Streamlit App ---
 
 
 def main():
@@ -417,12 +342,12 @@ def main():
     model, scaler = load_artifacts(selected_crop)
 
     if st.sidebar.checkbox("Show Cache Status"):
-        if os.path.exists(CACHE_FILE):
+        if WEATHER_CACHE_FILE.exists():
             st.sidebar.success("Cache File Exists")
             try:
-                c_df = pd.read_csv(CACHE_FILE)
+                c_df = pd.read_csv(WEATHER_CACHE_FILE)
                 st.sidebar.write(f"Entries: {len(c_df)}")
-            except:
+            except Exception:
                 st.sidebar.error("Cache Corrupt")
         else:
             st.sidebar.warning("Cache Empty")
@@ -434,7 +359,7 @@ def main():
 
     if model is None:
         st.error(
-            f"Model artifacts for {selected_crop} not found. Run `train_all_crops.py`."
+            f"Model artifacts for {selected_crop} not found in models/ directory."
         )
         st.stop()
 
@@ -472,7 +397,6 @@ def main():
             )
 
         with st.spinner("Fetching weather data..."):
-
             df_api, source_status = fetch_unified_weather(lat, lon)
 
             if not df_api.empty:
@@ -484,8 +408,17 @@ def main():
                     X_input = prepare_input_features(
                         simulated_data, feat_names, baseline_price
                     )
-                    X_scaled = scaler.transform(X_input)
-                    predicted_price = model.predict(X_scaled)[0]
+                    
+                    if scaler:
+                        X_scaled = scaler.transform(X_input)
+                        pred_raw = model.predict(X_scaled)[0]
+                    else:
+                        pred_raw = model.predict(X_input)[0]
+
+                    if "onion" in selected_crop.lower():
+                        predicted_price = baseline_price + pred_raw
+                    else:
+                        predicted_price = pred_raw
 
                     deviation = predicted_price - baseline_price
                     pct_change = (deviation / baseline_price) * 100
@@ -493,7 +426,7 @@ def main():
 
                     col1, col2, col3 = st.columns(3)
                     col1.metric(
-                        f"Projected Price",
+                        "Projected Price",
                         f"₹ {predicted_price:,.0f}",
                         delta=f"{pct_change:.1f}%",
                         delta_color="inverse",
@@ -509,7 +442,7 @@ def main():
                         risk_label, risk_color = "LOW RISK", "green"
                         risk_desc = "Favorable weather conditions."
 
-                    col2.markdown(f"### Risk Level")
+                    col2.markdown("### Risk Level")
                     col2.markdown(
                         f"<h2 style='color:{risk_color}'>{risk_label}</h2>",
                         unsafe_allow_html=True,

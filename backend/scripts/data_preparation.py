@@ -111,15 +111,23 @@ def create_lagged_features(df_weekly, lag_window=LAG_WINDOW):
     return df_lagged
 
 if __name__ == "__main__":
-    file_path = 'semifinal.csv' 
-    df = load_data(file_path)
+    from pathlib import Path
+    backend_dir = Path(__file__).resolve().parent.parent
+    raw_data_dir = backend_dir / "data" / "raw"
+    processed_data_dir = backend_dir / "data" / "processed"
+    processed_data_dir.mkdir(parents=True, exist_ok=True)
+
+    file_path = raw_data_dir / "semifinal.csv"
+    if not file_path.exists():
+        file_path = raw_data_dir / "test.csv"
+
+    df = load_data(str(file_path))
     df_cleaned = drop_redundant_columns(df)
     df_time_series = preprocess_and_aggregate_weekly(df_cleaned, commodity=TARGET_COMMODITY)
 
     if df_time_series is not None:
         df_final_features = create_lagged_features(df_time_series, lag_window=LAG_WINDOW)
-        output_file = f'{TARGET_COMMODITY.lower()}_market_lagged_features.csv'
+        output_file = processed_data_dir / f"{TARGET_COMMODITY.lower()}_market_lagged_features.csv"
         df_final_features.to_csv(output_file)
         print(f"\n--- SUCCESS ---")
         print(f"Saved to: {output_file}")
-        print("Please re-run model_training.py now.")
